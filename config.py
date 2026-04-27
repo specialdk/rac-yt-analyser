@@ -19,8 +19,8 @@ class Config:
     # Rate limiting settings
     MAX_REQUESTS_PER_MINUTE = 10
 
-    # AI settings
-    AI_MODEL = "claude-3-7-sonnet-20250219"
+    # AI settings - Updated to latest model
+    AI_MODEL = "claude-sonnet-4"
     MAX_TRANSCRIPT_LENGTH = 50000
     MAX_USER_TRANSCRIPT_LIMIT = 100000
 
