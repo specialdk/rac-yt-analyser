@@ -92,6 +92,7 @@ class YouTubeService:
         """Get video transcript with robust retry logic and anti-bot measures"""
         max_retries = 3
         base_delay = 1.0
+        should_try_ytdlp = False  # Flag to trigger yt-dlp fallback
 
         for attempt in range(max_retries):
             try:
@@ -174,8 +175,8 @@ class YouTubeService:
                         "is_generated": transcript.is_generated,
                         "transcript_type": transcript_type,
                         "word_count": len(full_text.split()),
-                        "original_length": original_length,  # Add this
-                        "was_truncated": was_truncated,  # Add this
+                        "original_length": original_length,
+                        "was_truncated": was_truncated,
                         "raw_data": transcript_data[:50],
                         "success": True,
                         "attempts": attempt + 1,
@@ -187,13 +188,10 @@ class YouTubeService:
                     session.close()
 
             except TranscriptsDisabled:
-                return {
-                    "success": False,
-                    "error": "Transcripts are disabled for this video",
-                    "error_type": "transcripts_disabled",
-                    "user_message": "This video does not have captions available. The creator may not have enabled subtitles.",
-                    "attempts": attempt + 1,
-                }
+                print(f"TranscriptsDisabled error - will try yt-dlp fallback")
+                should_try_ytdlp = True
+                break  # Exit retry loop and try yt-dlp
+                
             except VideoUnavailable:
                 return {
                     "success": False,
@@ -203,13 +201,10 @@ class YouTubeService:
                     "attempts": attempt + 1,
                 }
             except NoTranscriptFound:
-                return {
-                    "success": False,
-                    "error": "No transcripts found in supported languages",
-                    "error_type": "no_transcript_found",
-                    "user_message": "No captions were found in supported languages (English, Spanish, French, German, Italian, Portuguese).",
-                    "attempts": attempt + 1,
-                }
+                print(f"NoTranscriptFound error - will try yt-dlp fallback")
+                should_try_ytdlp = True
+                break  # Exit retry loop and try yt-dlp
+                
             except Exception as e:
                 error_msg = str(e).lower()
                 if "no element found" in error_msg or "xml" in error_msg:
@@ -222,7 +217,8 @@ class YouTubeService:
                         print(
                             f"XML parsing failed after {max_retries} attempts, falling back to yt-dlp"
                         )
-                        break  # Fall through to yt-dlp fallback
+                        should_try_ytdlp = True
+                        break
 
                 elif "429" in error_msg or "rate limit" in error_msg:
                     if attempt < max_retries - 1:
@@ -234,7 +230,8 @@ class YouTubeService:
                         print(
                             f"Rate limiting failed after {max_retries} attempts, falling back to yt-dlp"
                         )
-                        break  # Fall through to yt-dlp fallback
+                        should_try_ytdlp = True
+                        break
                 else:
                     if attempt < max_retries - 1:
                         print(
@@ -245,15 +242,26 @@ class YouTubeService:
                         print(
                             f"Unknown error after {max_retries} attempts, falling back to yt-dlp: {e}"
                         )
-                        break  # Fall through to yt-dlp fallback
+                        should_try_ytdlp = True
+                        break
 
-        # If we get here, all retries failed - try yt-dlp fallback
-        print("Primary transcript extraction failed, trying yt-dlp fallback...")
-        print(f"DEBUG: About to call yt-dlp for video_id: {video_id}")
-        result = self.get_transcript_with_ytdlp(video_id)
-        print(f"DEBUG: yt-dlp result success: {result.get('success')}")
-        print(f"DEBUG: yt-dlp text length: {len(result.get('text', ''))}")
-        return result
+        # If we should try yt-dlp, do it now
+        if should_try_ytdlp:
+            print("Primary transcript extraction failed, trying yt-dlp fallback...")
+            print(f"DEBUG: About to call yt-dlp for video_id: {video_id}")
+            result = self.get_transcript_with_ytdlp(video_id, max_transcript_length)
+            print(f"DEBUG: yt-dlp result success: {result.get('success')}")
+            print(f"DEBUG: yt-dlp text length: {len(result.get('text', ''))}")
+            return result
+        
+        # If we get here without triggering yt-dlp, return final error
+        return {
+            "success": False,
+            "error": "All transcript extraction methods failed",
+            "error_type": "extraction_failed",
+            "user_message": "Unable to extract transcript after trying multiple methods.",
+            "attempts": max_retries,
+        }
 
     def get_transcript_with_ytdlp(self, video_id, max_transcript_length=None):
         """Fallback transcript extraction using yt-dlp"""
@@ -269,7 +277,7 @@ class YouTubeService:
                 cmd = [
                     "python",
                     "-m",
-                    "yt_dlp",  # ← Use Python module instead
+                    "yt_dlp",
                     "--write-subs",
                     "--write-auto-subs",
                     "--sub-langs",
@@ -284,6 +292,8 @@ class YouTubeService:
                     url,
                 ]
 
+                print(f"DEBUG: Running yt-dlp command: {' '.join(cmd)}")
+                
                 # Execute yt-dlp command
                 process = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=30
@@ -297,13 +307,19 @@ class YouTubeService:
                     print(f"DEBUG: stdout: {process.stdout}")
                     raise Exception(f"yt-dlp failed: {process.stderr}")
 
+                print(f"DEBUG: yt-dlp command succeeded")
+                print(f"DEBUG: Looking for subtitle files in {temp_dir}")
+                
                 # Look for subtitle files
                 subtitle_files = []
                 for file in os.listdir(temp_dir):
                     if file.endswith(".vtt"):
                         subtitle_files.append(os.path.join(temp_dir, file))
+                        print(f"DEBUG: Found subtitle file: {file}")
 
                 if not subtitle_files:
+                    print(f"DEBUG: No .vtt files found in {temp_dir}")
+                    print(f"DEBUG: Directory contents: {os.listdir(temp_dir)}")
                     raise Exception("No subtitle files found")
 
                 # Read the first available subtitle file
@@ -314,16 +330,21 @@ class YouTubeService:
                     raise Exception("Failed to parse subtitle content")
 
                 # Truncate if too long
-                transcript_text = truncate_text(
-                    transcript_text, Config.MAX_TRANSCRIPT_LENGTH
-                )
+                transcript_limit = max_transcript_length or Config.MAX_TRANSCRIPT_LENGTH
+                original_length = len(transcript_text)
+                transcript_text = truncate_text(transcript_text, transcript_limit)
+                was_truncated = len(transcript_text) < original_length
+
+                print(f"DEBUG: Successfully extracted transcript via yt-dlp: {len(transcript_text)} chars")
 
                 return {
                     "text": transcript_text,
                     "language": "en",
-                    "is_generated": True,  # yt-dlp usually gets auto-generated subs
+                    "is_generated": True,
                     "transcript_type": "yt-dlp-extracted",
                     "word_count": len(transcript_text.split()),
+                    "original_length": original_length,
+                    "was_truncated": was_truncated,
                     "raw_data": [],
                     "success": True,
                     "attempts": 1,
@@ -331,6 +352,7 @@ class YouTubeService:
                 }
 
         except subprocess.TimeoutExpired:
+            print(f"DEBUG: yt-dlp subprocess timeout")
             return {
                 "success": False,
                 "error": "yt-dlp extraction timeout",
@@ -338,7 +360,8 @@ class YouTubeService:
                 "user_message": "Transcript extraction timed out. This may be due to video length or network issues.",
                 "attempts": 1,
             }
-        except FileNotFoundError:
+        except FileNotFoundError as e:
+            print(f"DEBUG: yt-dlp FileNotFoundError: {e}")
             return {
                 "success": False,
                 "error": "yt-dlp not found",
@@ -347,6 +370,7 @@ class YouTubeService:
                 "attempts": 1,
             }
         except Exception as e:
+            print(f"DEBUG: yt-dlp exception: {e}")
             return {
                 "success": False,
                 "error": f"yt-dlp extraction failed: {str(e)}",
